@@ -1,0 +1,383 @@
+---
+title: "Multivariate hypothesis"
+author: "Lina Laguenani"
+date: "2025-12-06"
+output: html_document
+---
+
+First, the methylation dataset was loaded into R using the read.csv() function. The tidyverse package was loaded to allow for efficient data manipulation and visualization. To verify that the dataset was imported correctly, the first ten rows were showed using the head() function. This step ensures that the dataset structure and variable names are correctly recognized before further analysis.
+This step ensures that the file is readable, the columns are recognized properly, and the dataset contains valid observations before performing any analysis.
+```{r}
+#install.packages("Tidyverse")
+library(tidyverse)
+dataset <- read.csv("colon_dataset.csv")
+dataset_short <- head(dataset, 10)
+dataset_short
+```
+
+Next, the Bioconductor package rtracklayer was installed and loaded to enable working with files in BED format. The promoter annotation file promoter_hg38_extended.bed was imported into R with read.table(). This annotation table is essential to link the methylation loci in the main dataset to specific genes, so that methylation values can later be analyzed and interpreted at the gene level for the multivariate hypothesis on cancer type and sex.
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("rtracklayer")
+```
+
+```{r}
+library(rtracklayer)
+chr_dataset <- read.table("promoter_hg38_extended.bed", sep = "\t", header = TRUE)
+chr_dataset
+```
+Data pre-processing:
+step 1: missing values
+
+First, the main metadata variables (sample identifiers, organism, gender, age, tissue, source of sample, clinical stage, and site) were listed in exclude_cols so they would not be altered. All remaining columns, which represent methylation features, were converted to numeric, while non‑numeric entries turned into NA. 
+This step standardizes the methylation matrix and ensures that missing or invalid methylation values are consistently encoded as NA, which is essential for correctly quantifying and handling missing data in later analyses.
+```{r}
+library(dplyr)
+
+exclude_cols <- c(
+  "label_title",
+  "label_organism",
+  "label_gender",
+  "label_age",
+  "label_tissue",
+  "label_source_of_sample",
+  "label_clinical.stage",   # check this matches exactly your column name
+  "label_site.label"        # same here
+)
+
+dataset_clean <- dataset %>%
+  mutate(
+    across(
+      .cols = !all_of(exclude_cols),   # all columns except metadata
+      .fns  = ~ suppressWarnings(as.numeric(.))
+    )
+  )
+```
+
+For each variable in dataset_clean, the proportion of missing values was calculated by taking the column-wise mean of the logical matrix is.na(dataset_clean) and multiplying by 100 to obtain percentages. This provides the identification of loci with missingness that could compromise the reliability of statistical tests.
+```{r}
+# percentage of NA per column (like df.isna().mean() * 100)
+na_percentage <- colMeans(is.na(dataset_clean)) * 100
+na_percentage
+```
+
+The vector of missing values percentages was converted into a tibble and visualized as a bar plot using ggplot2. 
+By plotting the percentage of missing values for each column, this figure reveals the overall pattern of missingness across the dataset and helps to visually justify the choice of a 20% threshold: variables with very high missingness stand out clearly, while most features show low missing rates.
+```{r}
+library(tidyverse)
+
+na_df <- tibble(
+  column = names(na_percentage),
+  pct_na = as.numeric(na_percentage)
+)
+
+na_df %>%
+  arrange(pct_na) %>%
+  ggplot(aes(x = reorder(column, pct_na), y = pct_na)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Column",
+    y = "Percentage of NA values (%)",
+    title = "Percentage of NA by column"
+  ) +
+  theme_bw()
+```
+
+The vector metadata_cols lists all clinical and sample‑level variables that should always be retained in the dataset. These columns contain the grouping information (cancer type and sex) required for testing the multivariate hypothesis about methylation differences, so they are exempt from feature‑filtering decisions based on missingness.
+```{r}
+metadata_cols <- c(
+  "label_title",
+  "label_organism",
+  "label_gender",
+  "label_age",
+  "label_tissue",
+  "label_source_of_sample",
+  "label_clinical.stage",
+  "label_site.label"
+)
+```
+
+Here, variables with at most 20% missing values were identified (cols_low_na) and combined with the predefined metadata columns. The resulting cols_to_keep vector contains all metadata variables and only those methylation features that satisfy the missingness criterion. 
+This step removes loci with very sparse data, balancing data quality with feature retention so that downstream ANOVA models are based on sufficiently complete methylation measurements.
+```{r}
+all_cols <- colnames(dataset_clean)
+low_na <- na_percentage <= 20
+cols_low_na <- names(na_percentage)[low_na]
+
+cols_to_keep <- intersect(union(metadata_cols, cols_low_na), all_cols)
+cols_to_keep
+```
+
+The dataset was then restricted to the selected columns, producing dataset_filtered, which includes all necessary metadata and only methylation features with ≤20% missing values.
+```{r}
+dataset_filtered <- dataset_clean[, cols_to_keep]
+dataset_filtered
+```
+
+Finally, missing values percentages were recomputed on the filtered dataset to verify that the feature‑selection step worked as intended. For methylation features (excluding metadata), the maximum missingness now falls at or below the 20% threshold, confirming that the dataset used for hypothesis testing contains only variables with acceptable levels of missing data.
+```{r}
+check_na_percentage <- colMeans(is.na(dataset_filtered)) * 100
+check_na_percentage
+```
+
+Step 2: prepare dataset for statistical testing
+
+This step removes extra spaces from the label_tissue column.
+This ensures that all samples from the same cancer type are grouped under one consistent label when you later compare methylation between tissue types and sex.
+```{r}
+library(stringr)
+
+dataset_filtered$label_tissue <- str_squish(dataset_filtered$label_tissue)
+```
+
+Here, the dataset is restricted to samples whose label_tissue is “Lung cancer”, “Stomach cancer”, or “Colon and rectum cancer”. This creates cancer_dataset, which contains exactly the three cancer types needed for the multivariate hypothesis, so all subsequent methylation analyses and ANOVA models focus only on the groups that are relevant to testing whether methylation differs between cancer type and sex.
+```{r}
+library(dplyr)
+
+cancer_dataset <- dataset_filtered %>%
+  filter(label_tissue %in% c(
+    "Lung cancer",
+    "Stomach cancer",
+    "Colon and rectum cancer"
+  ))
+cancer_dataset
+```
+
+Now we want to link each methylation locus (chr_start_end) to its corresponding gene and then renames the locus columns with gene-based names so that the downstream analysis can be interpreted biologically.
+
+First, all methylation columns whose names start with "chr" are selected as promoter/locus features, separating them from the clinical metadata. These column names are then split into chromosome, start, and end positions and converted to integers, creating a small table of genomic coordinates. This coordinate table is joined to the promoter annotation file (chr_dataset), which contains, for each genomic interval, the matching gene name. After the join, a new set of column names is constructed: if a locus has an associated gene in the annotation, its column is renamed to that gene; if not, the original coordinate string is kept as a fallback. Finally, these new names are assigned back to the methylation columns in new_cancer_dataset. As a result, the dataset now contains methylation measurements indexed by gene (e.g. NOC2L_1, KLHL17_1, …) rather than raw coordinates, which makes it possible to test the multivariate hypothesis.
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1) Find loci columns (those starting with "chr") in the cancer_dataset
+promoter_cols <- grep("^chr", names(cancer_dataset), value = TRUE)
+
+# 2) Parse column names into chrom, start, end
+promoter_map <- tibble(colname = promoter_cols) %>%
+  separate(colname, into = c("chrom", "start", "end"), sep = "_") %>%
+  mutate(
+    start = as.integer(start),
+    end   = as.integer(end)
+  )
+
+# 3) Join with chr_dataset to get gene names
+promoter_map <- promoter_map %>%
+  left_join(
+    chr_dataset,
+    by = c("chrom" = "chrom",
+           "start" = "chromStart",
+           "end"   = "chromEnd")
+  )
+
+# 4) Build new names: prefer gene name, else keep chr_start_end
+new_names <- promoter_map$name
+new_names[is.na(new_names)] <- paste(promoter_map$chrom,
+                                     promoter_map$start,
+                                     promoter_map$end,
+                                     sep = "_")
+
+# 5) Apply new names to the promoter columns in cancer_dataset
+new_cancer_dataset <- cancer_dataset
+names(new_cancer_dataset)[names(new_cancer_dataset) %in% promoter_cols] <- new_names
+```
+This was to quickly lists all column names in our current analysis dataset.
+```{r}
+colnames(new_cancer_dataset)
+```
+
+Step 3: statistical analysis for the multivariate hypothesis (two-way ANOVA)
+
+First, we take new_cancer_dataset and keep only samples whose label_tissue is one of the three cancer types included in the hypothesis (lung, stomach, colon/rectum), ensuring that no other tissues enter the model. 
+Then we created two new factor variables: cancer_type, derived from label_tissue, and sex, derived from label_gender. 
+Treating these as factors is necessary for a two-way ANOVA, because it tells the model to compare group means across the combinations of cancer type and sex when testing whether gene-level methylation differs between these groups.
+```{r}
+library(dplyr)
+
+data_anova <- new_cancer_dataset %>%
+  filter(label_tissue %in% c("Lung cancer", "Stomach cancer", "Colon and rectum cancer")) %>%
+  mutate(
+    cancer_type = factor(label_tissue),
+    sex         = factor(label_gender)
+  )
+```
+
+We selected 20 genes.
+A two-way ANOVA was performed with cancer type and sex as explanatory factors. 
+For each gene the model tests simultaneously whether mean methylation of this gene differs between the three cancer types, between males and females, and whether the effect of sex depends on cancer type (interaction). 
+
+The summary() output provides p‑values for the main effects (cancer_type, sex) and their interaction term (cancer_type:sex), allowing formal evaluation of the multivariate hypothesis that methylation levels vary by cancer type and sex. 
+
+This procedure was repeated for 20 genes in total, giving a gene‑by‑gene assessment of methylation differences across the cancer–sex groups.
+```{r}
+#two-way ANOVA for one gene (for example: TERF2_1)
+gene_TERF2_1 <- aov(TERF2_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_TERF2_1)
+```
+```{r}
+#two-way ANOVA for one gene (for example: DOHH_1)
+gene_DOHH_1 <- aov(DOHH_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_DOHH_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: SNIP1_1)
+gene_SNIP1_1 <- aov(SNIP1_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_SNIP1_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ACOT7_2)
+gene_ACOT7_2 <- aov(ACOT7_2 ~ cancer_type * sex, data = data_anova)
+summary(gene_ACOT7_2)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: RPL3_1)
+gene_RPL3_1 <- aov(RPL3_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_RPL3_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: LAMTOR5_2)
+gene_LAMTOR5_2 <- aov(LAMTOR5_2 ~ cancer_type * sex, data = data_anova)
+summary(gene_LAMTOR5_2)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: AP3D1_1)
+gene_AP3D1_1 <- aov(AP3D1_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_AP3D1_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ZDHHC5_1)
+gene_ZDHHC5_1 <- aov(ZDHHC5_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_ZDHHC5_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: GSK3A_4)
+gene_GSK3A_4 <- aov(GSK3A_4 ~ cancer_type * sex, data = data_anova)
+summary(gene_GSK3A_4)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: BAZ1A_1)
+gene_BAZ1A_1 <- aov(BAZ1A_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_BAZ1A_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ARHGAP33_1)
+gene_ARHGAP33_1 <- aov(ARHGAP33_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_ARHGAP33_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: FXR2_1)
+gene_FXR2_1 <- aov(FXR2_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_FXR2_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: FBXL12_1)
+gene_FBXL12_1 <- aov(FBXL12_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_FBXL12_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: FKBP8_1)
+gene_FKBP8_1 <- aov(FKBP8_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_FKBP8_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ANKRD40_1)
+gene_ANKRD40_1 <- aov(ANKRD40_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_ANKRD40_1)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: DOHH_2)
+gene_DOHH_2 <- aov(DOHH_2 ~ cancer_type * sex, data = data_anova)
+summary(gene_DOHH_2)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ZDHHC5_2)
+gene_ZDHHC5_2 <- aov(ZDHHC5_2 ~ cancer_type * sex, data = data_anova)
+summary(gene_ZDHHC5_2)
+```
+
+```{r}
+#two-way ANOVA for one gene (for example: ZDHHC5_1)
+gene_ZDHHC5_1 <- aov(ZDHHC5_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_ZDHHC5_1)
+```
+
+```{r}
+#two-way ANOVA for gene FITM2_1
+gene_FITM2_1 <- aov(FITM2_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_FITM2_1)
+```
+
+```{r}
+#two-way ANOVA for gene ZNF16_1
+gene_ZNF16_1 <- aov(ZNF16_1 ~ cancer_type * sex, data = data_anova)
+summary(gene_ZNF16_1)
+```
+
+Step 4: visualization of a the first 3 genes
+
+This figure shows boxplots of TERF2_1 methylation stratified by cancer type and sex. The distributions are very similar across all groups, with only small differences in median and spread, consistent with the two‑way ANOVA, which found no significant main effect of cancer type (p = 0.498), no effect of sex (p = 0.905), and no interaction between cancer type and sex (p = 0.513).
+```{r}
+library(ggplot2)
+
+ggplot(data_anova, aes(x = cancer_type, y = TERF2_1, fill = sex)) +
+  geom_boxplot(outlier.size = 0.8) +
+  labs(
+    title = "Methylation of TERF2_1 by cancer type and sex",
+    x = "Cancer type",
+    y = "Methylation (beta value)",
+    fill = "Sex"
+  ) +
+  theme_bw()
+```
+
+This figure displays boxplots of DOHH_1 methylation stratified by cancer type and sex. The median methylation levels and overall distributions appear broadly similar between lung, stomach, and colon/rectum cancers, and only modest differences are seen between males and females within each cancer type. This visual impression is consistent with the two-way ANOVA for DOHH_1, which showed no statistically significant main effect of cancer type (p = 0.101), no effect of sex (p = 0.532), and no cancer_type × sex interaction (p = 0.867), indicating that DOHH_1 methylation does not differ meaningfully between the three cancer types or between sexes in this dataset.
+```{r}
+library(ggplot2)
+
+ggplot(data_anova, aes(x = cancer_type, y = DOHH_1, fill = sex)) +
+  geom_boxplot(outlier.size = 0.8) +
+  labs(
+    title = "Methylation of DOHH_1 by cancer type and sex",
+    x = "Cancer type",
+    y = "Methylation (beta value)",
+    fill = "Sex"
+  ) +
+  theme_bw()
+```
+
+This figure shows boxplots of SNIP1_1 methylation stratified by cancer type and sex. In contrast to the previous genes, the median methylation levels of SNIP1_1 clearly differ between cancer types, with higher values in colon and rectum cancer and stomach cancer compared with lung cancer, while differences between males and females within each cancer type remain modest. This visual pattern is supported by the two-way ANOVA, which revealed a highly significant main effect of cancer type on SNIP1_1 methylation (p = 1.18 × 10⁻⁶), but no significant effect of sex (p = 0.786) and no cancer_type × sex interaction (p = 0.157). Together, these results indicate that SNIP1_1 methylation varies strongly between the three cancer types, whereas sex does not appear to influence methylation of this gene in this dataset.
+```{r}
+library(ggplot2)
+
+ggplot(data_anova, aes(x = cancer_type, y = SNIP1_1, fill = sex)) +
+  geom_boxplot(outlier.size = 0.8) +
+  labs(
+    title = "Methylation of SNIP1_1 by cancer type and sex",
+    x = "Cancer type",
+    y = "Methylation (beta value)",
+    fill = "Sex"
+  ) +
+  theme_bw()
+```
+
+general answer of the hypothesis?
+The multivariate hypothesis stated that there is a difference in methylation between three cancer types and sex. Based on the two‑way ANOVA results for 20 genes, this hypothesis is only partially supported.
+
+Across most genes, the ANOVA showed no significant main effect of cancer type, no effect of sex, and no cancer_type × sex interaction, indicating that methylation levels were broadly similar between colon and rectum cancer, lung cancer, and stomach cancer, and also between males and females for these loci. Only a small subset of genes, such as SNIP1_1, displayed a strong and statistically significant cancer‑type effect on methylation, while even for these genes the effect of sex remained non‑significant and no robust interactions between cancer type and sex were detected. Taken together, these findings suggest that, in this dataset and for the selected genes, methylation differences are detectable between cancer types for a few loci, but there is no consistent evidence that sex influences methylation, so the hypothesis is not generally supported for sex and is only weakly supported for cancer type.

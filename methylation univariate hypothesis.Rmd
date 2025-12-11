@@ -1,0 +1,192 @@
+---
+title: "PROJECT large scale"
+author: "Lina Laguenani"
+date: "2025-11-27"
+output: html_document
+---
+
+First, the methylation dataset was loaded into R using the read.csv() function. The tidyverse package was loaded to allow for efficient data manipulation and visualization. To verify that the dataset was imported correctly, the first ten rows were showed using the head() function. This step ensures that the dataset structure and variable names are correctly recognized before further analysis.
+This step ensures that the file is readable, the columns are recognized properly, and the dataset contains valid observations before performing any analysis.
+```{r}
+#install.packages("Tidyverse")
+library(tidyverse)
+dataset <- read.csv("colon_dataset.csv")
+dataset_short <- head(dataset, 10)
+dataset_short
+```
+
+Data pre-processing:
+step 1: missing values
+
+To assess data quality, the total number of missing values in the dataset was calculated using is.na() combined with sum(). 
+This gives a quick overview of how complete the dataset is and whether missing data may affect analysis reliability.
+```{r}
+sum(is.na(dataset))
+```
+
+Next, the proportion of missing values was calculated per column of the chromosome-loci only. This was done by dividing the number of missing values in each column by the number of rows and multiplying by 100. 
+This step identifies which features contain excessive missing data and may therefore be unsuitable for analysis.
+```{r}
+missing_percentage <- colSums(is.na(dataset))/nrow(dataset)*100
+missing_percentage
+```
+
+The histogram of missing value percentages per variable was used to visually assess the overall pattern of missing data across the dataset. Instead of choosing a threshold arbitrarily, the histogram allowed us to observe how missing values were distributed among all features.
+
+By inspecting the histogram, we could identify whether missingness was uniformly distributed or whether a clear separation existed between variables with low and high proportions of missing data. The visualization showed that most variables had relatively low percentages of missing values, while a smaller group of variables displayed substantially higher missing rates.
+
+Based on this distribution, a threshold of 20% missing data per variable was selected. This value was chosen because it effectively removed variables that showed heavy data loss, while retaining the majority of informative features. Setting the threshold at this level represented a balance between removing unreliable variables and preserving sufficient data for meaningful analysis.
+```{r}
+hist(missing_percentage,
+     main = "Distribution of Missing Percentages",
+     xlab = "Missing (%)",
+     col = "lightgray",
+     breaks = 20)
+```
+
+Only variables with 20% or less missing data were kept for analysis. Features exceeding this threshold were removed to maintain data reliability. A filtered dataset was created containing only the selected features.
+```{r}
+keep_features <- which(missing_percentage <= 20)
+filtered_dataset <- dataset[, keep_features]
+filtered_dataset
+```
+
+step 2: filter our dataset according to the hypothesis:
+
+From the filtered dataset, only samples labeled as “Lung cancer” were selected. This was done to focus the analysis strictly on lung cancer patients and exclude other cancer types.
+```{r}
+lung_dataset <- filtered_dataset[filtered_dataset$label_tissue == "Lung cancer", ]
+lung_dataset
+```
+
+Only variables relevant to the hypothesis were retained, including label title, age, tissue type, and clinical stage. 
+This step simplifies the dataset and avoids unnecessary complexity. Furthermore, reducing variables improves analysis efficiency and interpretability.
+```{r}
+lung_dataset_final <- lung_dataset[, c("label_title", 
+                                       "label_age", 
+                                       "label_tissue", 
+                                       "label_clinical.stage")]
+
+lung_dataset_final
+```
+
+step 3: checking variables type
+
+The str() function was used to inspect variable types. This ensures that age and clinical variables are in the correct format and reveals whether values are stored as numeric or character data.
+```{r}
+str(lung_dataset_final)
+```
+The age variable was converted into numeric format to enable calculations and grouping based on patient age. This conversion is essential for statistical analysis.
+```{r}
+filtered_dataset <- filtered_dataset %>%
+  mutate(label_age = as.numeric(label_age))
+
+str(filtered_dataset)
+```
+step 4: removing missing values according to the hypothesis
+
+Frequency tables were generated for age, tissue type, and clinical stage using the table() function. 
+Since the missing values we discarded from the chromosome loci were not necessary according to the hypothesis, we next examined the distribution of our variables (clinical stage, age, and tissue). This revealed that missing values remained, labeled "unknown." These were then removed. 
+
+More advanced imputation methods (e.g., mean imputation, KNN) were considered but not used to avoid reducing variability or distorting biological signals.
+```{r}
+table(lung_dataset_final$label_clinical.stage)
+```
+
+```{r}
+table(lung_dataset_final$label_age)
+```
+
+```{r}
+table(lung_dataset_final$label_tissue)
+```
+
+Patients with missing or unknown values in age or clinical stage, seen in the frequency tables, were removed. 
+Since statistical tests require complete data, excluding these records ensures valid and interpretable results.
+```{r}
+library(dplyr)
+
+lung_final<- lung_dataset_final %>%
+  filter(
+    label_clinical.stage != "" &
+    label_clinical.stage != "unknown" &
+    label_age != "" &
+    label_age != "unknown"
+  )
+lung_final
+```
+
+step 5: preparing the variables for the statistical analysis
+
+The study design evaluated whether lung cancer stage distribution differs by age group. Age was categorized as <60 vs. ≥60 years because this cutoff is commonly used in clinical research to distinguish younger from older adults and provides a clear, interpretable comparison. Tumor stage was grouped as early (I–II) versus advanced (III–IV) to reflect standard clinical distinctions between localized and more advanced disease. These categorizations allowed us to evaluate whether age is associated with disease severity at diagnosis in a clinically meaningful way. The statistical hypotheses were defined as:
+-	H0: There is no difference in how patients are distributed across lung cancer stages (I–II vs. III–IV) between patients under 60 and patients aged 60 or older.
+-	HA:  There is a difference in how patients are distributed across lung cancer stages (I–II vs. III–IV) between patients under 60 and patients aged 60 or older.
+
+```{r}
+library(dplyr)
+
+lung_analysis <- lung_final %>%
+  mutate(
+    # numeric age
+    label_age = as.numeric(label_age),
+    
+    # age group: <60 vs >=60
+    age_group = if_else(label_age < 60, "<60", ">=60"),
+    
+    # stage group: I/II vs III/IV (using Roman numerals Ⅰ Ⅱ Ⅲ Ⅳ)
+    stage_group = case_when(
+      label_clinical.stage %in% c("Ⅰ", "Ⅱ") ~ "I_II",
+      label_clinical.stage %in% c("Ⅲ", "Ⅳ") ~ "III_IV",
+      TRUE                                   ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(stage_group))   # keep only I–IV
+
+lung_analysis
+```
+
+A 2x2 contingency table is used because it shows the frequency distribution of patients across age groups and cancer stage groups. It displays how many patients fall into each combination of age group (<60 vs ≥60) and stage group (I–II vs III–IV), which allows a clear comparison between groups. This table provides the basis for statistical testing to determine whether an association exists between age and cancer stage.
+```{r}
+table(lung_analysis$age_group, lung_analysis$stage_group)
+```
+Row‑wise proportions were calculated to express how stages are distributed within each age group. 
+This allows comparison between age groups using relative percentages rather than absolute counts.
+```{r}
+tab <- table(lung_analysis$age_group, lung_analysis$stage_group)
+tab
+prop.table(tab, margin = 1)   
+```
+step 6: statistical testing the hypothesis
+
+A Chi‑squared test was performed to assess whether cancer stage and age group are statistically associated. Additionally, Fisher’s exact test was applied because it provides a more accurate p‑value when sample sizes are small, like in this case.
+```{r}
+chisq.test(tab)       
+fisher.test(tab)       
+```
+The chi-square test of independence indicated that age group and lung cancer stage were not statistically associated, as evidenced by a chi-square value of zero and a p-value of 1.00. 
+Fisher’s exact test produced an identical p-value of 1.00, confirming that the observed distribution of stages was entirely consistent with what would be expected if no relationship between age and stage existed. 
+
+These statistical results indicate that, in this dataset, age did not influence whether patients presented with early or advanced disease at the time of diagnosis.
+
+step 7: visualization
+
+A bar plot was created using ggplot2 to visualize the distribution of cancer stages by age group. Percentages are displayed above each bar to improve readability. This visualization makes it easier to compare early and late stages across age groups.
+```{r}
+library(dplyr)
+library(ggplot2)
+
+plot_data <- lung_analysis %>%
+  filter(!is.na(age_group), !is.na(stage_group)) %>%
+  count(age_group, stage_group) %>%
+  group_by(age_group) %>%
+  mutate(percent = n / sum(n) * 100)
+
+ggplot(plot_data, aes(x = age_group, y = percent, fill = stage_group)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = paste0(round(percent, 1), "%")),
+            position = position_dodge(width = 0.7),
+            vjust = -0.3, size = 3.5) +
+  labs(title = "Lung cancer stage distribution by age group", x = "Age group", y = "Patient percentage", fill = "Stage group") +
+  ylim(0, 100) +
+  theme_minimal()
+```
